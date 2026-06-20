@@ -1,8 +1,0 @@
-{
-  "functions": {
-    "api/ocr.js": {
-      "maxDuration": 30
-    }
-  },
-  "regions": ["iad1"]
-}
