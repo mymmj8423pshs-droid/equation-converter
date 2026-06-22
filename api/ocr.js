@@ -1,0 +1,104 @@
+/* ============================================================
+   수식 변환기 — 사진 인식 서버 (Vercel 버전)
+   ------------------------------------------------------------
+   · 이 파일은 저장소의  api/ocr.js  경로에 둡니다.
+   · Vercel 무료 함수는 기본적으로 미국(워싱턴, iad1)에서 실행되어
+     Gemini 지역 차단('User location not supported')을 피합니다.
+   · Vercel 프로젝트 Settings → Environment Variables 에 등록:
+       Name : GEMINI_API_KEY
+       Value: aistudio.google.com 에서 발급받은 키
+   ------------------------------------------------------------
+   · 과부하(503/429) 시 자동 재시도 + 다른 모델로 자동 전환(폴백)
+   ============================================================ */
+
+// 우선순위 순서대로 시도 (앞이 막히면 뒤로 폴백)
+// Vercel 함수 실행 시간 한도 (무료 플랜 최대 60초)
+export const maxDuration = 60;
+
+const MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"];
+const MAX_RETRY = 1;        // 같은 모델 재시도 횟수
+const RETRY_DELAY_MS = 700; // 재시도 간 대기
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function callGemini(model, key, prompt, mediaType, image) {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      contents: [{
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: mediaType, data: image } }
+        ]
+      }],
+      generationConfig: { temperature: 0, maxOutputTokens: 1024 }
+    })
+  });
+}
+
+export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "POST 요청만 허용됩니다" });
+
+  try {
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const image = body.image;
+    const mediaType = body.media_type || "image/png";
+    const prompt = body.prompt || "Transcribe the math in the image into LaTeX. Output only raw LaTeX.";
+
+    if (!image) return res.status(400).json({ error: "이미지 데이터가 없습니다" });
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: "GEMINI_API_KEY 가 설정되지 않았습니다" });
+
+    let lastErr = "알 수 없는 오류";
+
+    // 모델 폴백 루프
+    for (const model of MODELS) {
+      // 같은 모델 재시도 루프
+      for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+        let upstream;
+        try {
+          upstream = await callGemini(model, key, prompt, mediaType, image);
+        } catch (e) {
+          lastErr = String(e);
+          await sleep(RETRY_DELAY_MS);
+          continue;
+        }
+
+        const data = await upstream.json();
+
+        if (upstream.ok) {
+          const cand = data.candidates && data.candidates[0];
+          const parts = cand && cand.content && cand.content.parts ? cand.content.parts : [];
+          const text = parts.map(p => p.text || "").join("");
+          return res.status(200).json({ content: [{ type: "text", text }] });
+        }
+
+        // 에러 분류
+        const status = upstream.status;
+        lastErr = (data && data.error && data.error.message) ? data.error.message : ("Gemini 오류 " + status);
+
+        // 과부하/속도제한(503, 429)이면 잠깐 쉬고 재시도, 그래도 안되면 다음 모델로
+        if (status === 503 || status === 429) {
+          if (attempt < MAX_RETRY) { await sleep(RETRY_DELAY_MS); continue; }
+          break; // 다음 모델로 폴백
+        }
+
+        // 그 외 오류(키 오류 등)는 재시도/폴백 의미 없음 → 즉시 반환
+        return res.status(status).json({ error: lastErr });
+      }
+    }
+
+    // 모든 모델/재시도 실패
+    return res.status(503).json({ error: "서버가 잠시 혼잡해요. 잠시 후 다시 시도해주세요. (" + lastErr + ")" });
+
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+}
